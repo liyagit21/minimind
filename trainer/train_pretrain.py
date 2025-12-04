@@ -7,6 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
 import time
 import warnings
+import numpy as np
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
@@ -45,24 +46,25 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.unscale_(optimizer)  # 解除梯度缩放
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 梯度裁剪
 
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer)  # 更新模型参数
+            scaler.update()         # 更新缩放器
 
-            optimizer.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-
-        if step % args.log_interval == 0 or step == iters - 1:
+            optimizer.zero_grad(set_to_none=True) # 清空梯度
+            torch.cuda.empty_cache()  # 释放GPU缓存
+      
+        if step % args.log_interval == 0 or step == iters - 1:  # 记录日志
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            max_vio = np.mean(res.aggregated_stats["max_vio_selections"])
+            load_imbalance = np.mean(res.aggregated_stats["load_imbalance"])
+            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: max_vio:{max_vio} load_imbalance:{load_imbalance}')
             
-            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
-            
-            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, "load_imbalance": load_imbalance})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
@@ -87,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=16, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
@@ -130,6 +132,7 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 使用分布式采样器，每个进程看到的数据量是len(train_ds)/world_size
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -158,4 +161,6 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
         else: # 默认从头开始
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
+            # print("***len(loader):", len(loader))
+            # print("***len(train_ds) // args.batch_size", len(train_ds) // args.batch_size)
             train_epoch(epoch, loader, len(loader), 0, wandb)
