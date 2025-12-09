@@ -34,7 +34,11 @@ class MiniMindConfig(PretrainedConfig):
             n_routed_experts: int = 4,
             n_shared_experts: int = 1,
             scoring_func: str = 'softmax',
+<<<<<<< HEAD
             aux_loss_alpha: float = 0.0,    # 0.1
+=======
+            aux_loss_alpha: float = 0.01,
+>>>>>>> upstream/master
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
             adapter_thresholds = 1,
@@ -517,7 +521,7 @@ class MOEFeedForward(nn.Module):
             # 训练模式下，将输入分配给选定的专家，并加权求和输出
             if self.training:
                 x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)   # x shape(bsz*seq_len*num_experts_per_tok,hidden_size)
-                y = torch.empty_like(x, dtype=torch.float16)    # 用于存储专家输出
+                y = torch.empty_like(x, dtype=x.dtype)    # 用于存储专家输出
                 for i, expert in enumerate(self.experts):   # 遍历所有专家将输入分配给专家
                     # x[flat_topk_idx == i]根据布尔索引选择出指定位置的输入，
                     # 比如x=[[1, 2],[3, 4],[5, 6]], flat_topk_idx == i = [True,False,True]
