@@ -233,6 +233,28 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))) # 这里的*是逐元素相乘，门控机制，用于增强模型的表达能力
 
+# 计算动态阈值相关的损失
+class ThresholdRegularizationLoss(nn.Module):
+    def __init__(self, target_sparsity=0.5, diversity_weight=0.1):
+        super().__init__()
+        self.target_sparsity = target_sparsity
+        self.diversity_weight = diversity_weight
+    
+    def forward(self, expert_usage, total_tokens, expert_thresholds):
+        # 1. 稀疏度正则化：鼓励达到目标稀疏度
+        actual_sparsity = 1 - expert_usage.sum() / (total_tokens * len(expert_usage))
+        sparsity_loss = (actual_sparsity - self.target_sparsity) ** 2
+        
+        # 2. 阈值多样性正则化：鼓励阈值分散
+        threshold_std = torch.std(expert_thresholds)
+        diversity_loss = -threshold_std  # 最大化标准差
+        
+        # 3. 阈值平滑正则化：避免极端值
+        smooth_loss = torch.var(expert_thresholds)
+        
+        total_loss = sparsity_loss + self.diversity_weight * diversity_loss + 0.01 * smooth_loss
+        return total_loss
+
 # 用于在MoE中选择专家并计算辅助损失aux loss
 class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
@@ -249,7 +271,7 @@ class MoEGate(nn.Module):
         self.gating_dim = config.hidden_size
         self.adapter_thresholds = config.adapter_thresholds
         
-        self.use_additive_bias = True,
+        self.use_additive_bias = True
         self.update_rate = 0.001
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))   # 门控网络的权重矩阵
         self.reset_parameters()
@@ -305,7 +327,8 @@ class MoEGate(nn.Module):
                 topk_idx_flat, 
                 minlength=self.n_routed_experts
             ).float()  # [n_routed_experts]
-        self.expert_load = expert_loads
+            
+        self.expert_loads = expert_loads
         total_tokens = bsz * seq_len
         total_selections = bsz * seq_len * self.top_k
         
@@ -331,29 +354,7 @@ class MoEGate(nn.Module):
         load_ratio = max_load / min_load if min_load > 0 else float('inf')
         expert_sparsity = 1 - (expert_loads.sum().float() / (total_tokens*self.n_routed_experts))
         # print("***expert_sparsity:", expert_sparsity)
-        
-        """
-        更新专家偏置 - 算法1的核心实现
-        论文中的更新规则：b_i = b_i + u * sign(e_i)
-        """
-        if self.training and self.alpha == 0.0:
-            load_errors = self.expert_load - expected_load_selections 
-            # load_errors = self.expert_load - expected_load_tokens #  不清楚为什么传这个进去训练的时候会报错，有参数在前向传播的时候没有使用导致梯度同步出现问题
-            
-            # 根据论文中的更新规则更新偏置
-            if self.use_additive_bias:
-                # 加法偏置更新
-                update_delta = self.update_rate * torch.sign(load_errors)
-                self.expert_biases.data -= update_delta  # 注意：负载重的专家偏置减小
-            else:
-                # 乘法偏置更新
-                # 对于乘法偏置，我们需要确保偏置始终为正数
-                update_delta = self.update_rate * torch.sign(load_errors)
-                self.expert_biases.data *= (1 - update_delta / 10)  # 缩放更新量
-                
-            # 更新历史负载记录
-            self.expert_loads.data = 0.9 * self.expert_loads + 0.1 * expert_loads
-                
+       
         return {
             # 'expert_loads': expert_loads.detach().cpu(),
             # 'max_vio_tokens': max_vio_tokens.item(),  # 越小越好
@@ -367,6 +368,34 @@ class MoEGate(nn.Module):
             # 'total_tokens': total_tokens,
             # 'total_selections': total_selections,
         }
+        
+        
+    def update_expert_biases(self, total_tokens):
+        expected_load_selections = total_tokens * self.top_k / self.n_routed_experts
+       
+        """
+        更新专家偏置 - 算法1的核心实现
+        论文中的更新规则：b_i = b_i + u * sign(e_i)
+        """
+        if self.training and self.alpha == 0.0:
+            with torch.no_grad():
+                load_errors = self.expert_loads - expected_load_selections
+                # load_errors = self.expert_load - expected_load_tokens #  不清楚为什么传这个进去训练的时候会报错，有参数在前向传播的时候没有使用导致梯度同步出现问题
+                
+                # 根据论文中的更新规则更新偏置
+                if self.use_additive_bias:
+                    # 加法偏置更新
+                    update_delta = self.update_rate * torch.sign(load_errors)
+                    self.expert_biases.data -= update_delta  # 注意：负载重的专家偏置减小
+                else:
+                    # 乘法偏置更新
+                    # 对于乘法偏置，我们需要确保偏置始终为正数
+                    update_delta = self.update_rate * torch.sign(load_errors)
+                    self.expert_biases.data *= (1 - update_delta / 10)  # 缩放更新量
+                    
+                # 更新历史负载记录
+                # self.expert_loads.data = 0.9 * self.expert_loads + 0.1 * expert_loads
+                # self.expert_loads.mul_(0.9).add_(expert_loads * 0.1)
 
     def apply_loss_free_balancing(self, scores: torch.Tensor) -> torch.Tensor:
         """
@@ -421,6 +450,8 @@ class MoEGate(nn.Module):
             
         
         batch_stats = self.compute_statistics_update_bias(ret_idx, bsz, seq_len)
+        
+        self.update_expert_biases(bsz*seq_len)
         
         aux_loss = 0
         if self.training and self.alpha > 0.0:    # 仅在训练时计算辅助损失
