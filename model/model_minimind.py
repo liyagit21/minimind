@@ -34,11 +34,7 @@ class MiniMindConfig(PretrainedConfig):
             n_routed_experts: int = 4,
             n_shared_experts: int = 1,
             scoring_func: str = 'softmax',
-<<<<<<< HEAD
-            aux_loss_alpha: float = 0.0,    # 0.1
-=======
-            aux_loss_alpha: float = 0.01,
->>>>>>> upstream/master
+            aux_loss_alpha: float = 0.0,    # 0.01
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
             adapter_thresholds = 1,
@@ -333,8 +329,8 @@ class MoEGate(nn.Module):
         max_load = expert_loads.max()
         min_load = expert_loads[expert_loads > 0].min() if (expert_loads > 0).any() else 0
         load_ratio = max_load / min_load if min_load > 0 else float('inf')
-        
-        expert_sparsity = 1 - expert_loads.sum() / total_tokens*self.n_routed_experts
+        expert_sparsity = 1 - (expert_loads.sum().float() / (total_tokens*self.n_routed_experts))
+        # print("***expert_sparsity:", expert_sparsity)
         
         """
         更新专家偏置 - 算法1的核心实现
@@ -343,11 +339,6 @@ class MoEGate(nn.Module):
         if self.training and self.alpha == 0.0:
             load_errors = self.expert_load - expected_load_selections 
             # load_errors = self.expert_load - expected_load_tokens #  不清楚为什么传这个进去训练的时候会报错，有参数在前向传播的时候没有使用导致梯度同步出现问题
-            # print("***self.expert_load", self.expert_load)
-            # print("***expected_load_selections", expected_load_selections)
-            # # print("***expected_load_tokens", expected_load_tokens)
-            # print("***self.expert_load - expected_load_selections", self.expert_load - expected_load_selections)
-            # print("***load_errors", load_errors)
             
             # 根据论文中的更新规则更新偏置
             if self.use_additive_bias:
