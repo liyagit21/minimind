@@ -262,6 +262,54 @@ class ThresholdRegularizationLoss(nn.Module):
         total_loss = sparsity_loss + self.diversity_weight * diversity_loss + 0.01 * smooth_loss
 
         return total_loss
+      
+class ThresholdWeightLoss(nn.Module):
+    def __init__(self, target_sparsity=0.5, balance_weight=0.01, specialization_weight=0.1):    
+        super().__init__()
+        self.target_sparsity = target_sparsity
+        self.balance_weight = balance_weight
+        self.specialization_weight = specialization_weight
+        
+    def compute_sparsity_loss(self, expert_usage, total_tokens):
+        """控制整体稀疏度"""
+        actual_sparsity = 1 - expert_usage.sum() / (total_tokens * len(expert_usage))
+        sparsity_loss = F.mse_loss(actual_sparsity, 
+                                  torch.tensor(self.target_sparsity, device=actual_sparsity.device))
+        return sparsity_loss
+      
+    def compute_balance_loss(self, expert_usage, total_tokens):
+        """专家负载均衡损失"""
+        expert_usage_ratio = expert_usage / total_tokens
+        # 理想均匀分布
+        uniform_dist = torch.ones_like(expert_usage) / len(expert_usage)
+        
+        # KL散度衡量分布差异
+        balance_loss = F.kl_div(
+            F.log_softmax(expert_usage_ratio, dim=0),
+            F.softmax(uniform_dist, dim=0),
+            reduction='batchmean'
+        )
+        return balance_loss
+      
+    def compute_specialization_loss(self, gate_scores):
+        """专家专业性损失：鼓励专家专注于特定模式"""
+        # 计算每个专家的门控分数方差（高方差→高专业性）
+        expert_variance = gate_scores.var(dim=(0,))  # [num_experts]
+        
+        # 负方差损失（鼓励高方差）
+        specialization_loss = -expert_variance.mean()
+        return specialization_loss
+        
+    def forward(self, expert_usage, total_tokens, gate_scores):
+        sparsity_loss = self.compute_sparsity_loss(expert_usage, total_tokens)
+        balance_loss = self.compute_balance_loss(expert_usage, total_tokens)
+        specialization_loss = self.compute_specialization_loss(gate_scores)
+        # print("***sparsity_loss:", sparsity_loss)
+        # print("***balance_loss:", balance_loss)
+        # print("***specialization_loss:", specialization_loss)
+        total_loss = sparsity_loss + 1e-1 * balance_loss + 1e-2 * specialization_loss
+        return total_loss
+
         
 # 用于在MoE中选择专家并计算辅助损失aux loss
 class MoEGate(nn.Module):
@@ -298,18 +346,22 @@ class MoEGate(nn.Module):
         
         # 可学习的阈值参数 - 核心创新！
         # self.expert_thresholds = nn.Parameter(torch.full((self.n_routed_experts,), self.init_threshold))
-        # if self.adapter_thresholds:
+        if self.adapter_thresholds:
         #     self.expert_thresholds = nn.Parameter(torch.zeros(self.n_routed_experts))
+            self.expert_weights = nn.Parameter(torch.zeros((self.n_routed_experts, self.gating_dim)))
         
         # # 阈值约束（确保合理性）
         # self.threshold_clamp = (-1.0, 1.0)  # 可根据任务调整
         # # 将损失函数作为模块属性，确保梯度链路
         # self.threshold_loss_fn = ThresholdRegularizationLoss()
+        self.threshold_loss_fn = ThresholdWeightLoss()
         # self.adaptive_threshold_init() # 动态阈值初始化
   
             
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # 初始化阈值
+        # init.kaiming_uniform_(self.expert_thresholds, a=math.sqrt(5))
         
     # def compute_max_vio(self, expert_loads: torch.Tensor, total_tokens:int) -> float:
     #      """计算MaxVio指标 - 论文公式(4)"""
@@ -359,6 +411,7 @@ class MoEGate(nn.Module):
         total_tokens = bsz * seq_len
         total_selections = bsz * seq_len * self.top_k
         
+        print("***self.expert_loads:", self.expert_loads)
         # 计算两种MaxVio（根据论文理解不同）
         # 版本1：按token数计算（论文中可能更倾向这个）
         # 每个专家期望处理的token数
@@ -445,6 +498,8 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
+        threds = F.linear(hidden_states, self.expert_weights, None)
+        
         if self.scoring_func == 'softmax':
             # scores = torch.softmax(logits / 0.9, dim=-1)
             scores = torch.softmax(logits, dim=-1)
@@ -463,16 +518,18 @@ class MoEGate(nn.Module):
         
         total_tokens = bsz*seq_len
         # 应用loss-free的偏置
-        if self.alpha == 0.0:
-            scores = self.apply_loss_free_balancing(scores)
+        # if self.alpha == 0.0:
+        #     scores = self.apply_loss_free_balancing(scores)
         # print("***scores:", scores.size())
         
         ret_idx, ret_weight = [], []
         # 动态专家选择：使用可学习阈值！
         if self.adapter_thresholds:
             # expert_mask = scores > self.expert_thresholds.clamp(*self.threshold_clamp)
-            expert_mask = scores > 0
+            expert_mask = (scores > threds)
+            # expert_mask = scores > 0
             # print("***expert_mask.size:", expert_mask.size())
+            # print("***expert_mask:", expert_mask)
             ret_idx = expert_mask
             ret_weight = scores
         else:
@@ -494,32 +551,52 @@ class MoEGate(nn.Module):
         
         aux_loss = 0
         threshold_loss = 0
-        # if self.training:    # 仅在训练时计算辅助损失
-        #     if self.alpha > 0.0:
-        #         scores_for_aux = scores
-        #         aux_topk = self.top_k
-        #         topk_idx_for_aux_loss = topk_idx.view(bsz, -1)  # shape:[bsz*seq_len,top_k] -> [bsz,seq_len*top_k]
+        aux_and_adapter_thre = 0
+        if self.training:    # 仅在训练时计算辅助损失
+            if self.alpha > 0.0:
+                scores_for_aux = scores
+                if self.seq_aux:
+                    if aux_and_adapter_thre:    # 计算序列级别的辅助损失
+                        scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                        ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                        # 使用masked scatter计算激活次数
+                        activated_counts = expert_mask.view(bsz, seq_len, -1).sum(dim=1)  # 每个专家在每个批次中的激活次数
+                        ce = activated_counts.float()
+                        print("***ce", ce)
+                        print("***ce.size", ce.size())
+                        # 归一化负载分布
+                        total_activations = expert_mask.view(bsz, seq_len, -1).sum(dim=(1, 2)).float()  # 每个批次的总激活次数
+                        print("***total_activations", total_activations)
+                        print("***total_activations.size", total_activations.size())
+                        ce.div_(total_activations.view(-1, 1) / self.n_routed_experts)
+                        # 计算序列级别的辅助损失
+                        aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+                        # print("***here aux_loss:", aux_loss)
+                    else:
+                        aux_topk = self.top_k
+                        topk_idx_for_aux_loss = topk_idx.view(bsz, -1)  # shape:[bsz*seq_len,top_k] -> [bsz,seq_len*top_k]
+                        scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                        ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                        # 将torch.ones的值累加到ce中，索引由topk_idx_for_aux_loss指定
+                        # 将结果除以 (seq_len * aux_topk / self.n_routed_experts)，归一化负载分布
+                        ce.scatter_add_(1, topk_idx_for_aux_loss,
+                                        torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
+                            seq_len * aux_topk / self.n_routed_experts)       # ce计算每个专家在每个批次中的负载分布
                 
-        #         if self.seq_aux:    # 计算序列级别的辅助损失
-        #             scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-        #             ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-        #             # 将torch.ones的值累加到ce中，索引由topk_idx_for_aux_loss指定
-        #             # 将结果除以 (seq_len * aux_topk / self.n_routed_experts)，归一化负载分布
-        #             ce.scatter_add_(1, topk_idx_for_aux_loss,
-        #                             torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-        #                 seq_len * aux_topk / self.n_routed_experts)       # ce计算每个专家在每个批次中的负载分布
-        #             aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha   # 根据负载分布和分数分布计算序列级别的辅助损失
-        #         else:
-        #             mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)  # 将生成的专家索引转成one-hot编码，shape(bsz*seq_len*top_k, n_routed_experts)
-        #             ce = mask_ce.float().mean(0)   # 计算每个专家的负载分布，shape为(n_routed_experts,)
-        #             Pi = scores_for_aux.mean(0)   # 门控网络的输出
-        #             fi = ce * self.n_routed_experts
-        #             aux_loss = (Pi * fi).sum() * self.alpha
-        #     elif self.adapter_thresholds:
-        #         threshold_loss = self.threshold_loss_fn(self.expert_loads, total_tokens, self.expert_thresholds)
+                        aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha   # 根据负载分布和分数分布计算序列级别的辅助损失
+                else:
+                    mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)  # 将生成的专家索引转成one-hot编码，shape(bsz*seq_len*top_k, n_routed_experts)
+                    ce = mask_ce.float().mean(0)   # 计算每个专家的负载分布，shape为(n_routed_experts,)
+                    Pi = scores_for_aux.mean(0)   # 门控网络的输出
+                    fi = ce * self.n_routed_experts
+                    aux_loss = (Pi * fi).sum() * self.alpha
+            elif self.adapter_thresholds:
+                # threshold_loss = self.threshold_loss_fn(self.expert_loads, total_tokens, self.expert_thresholds)
+                threshold_loss = self.threshold_loss_fn(self.expert_loads, total_tokens, scores*expert_mask.float())
                 # print('***threshold_loss:', threshold_loss)
         # print("***threshold_loss:", threshold_loss)
-        ret_loss = aux_loss if aux_loss > 0 else threshold_loss     
+        ret_loss = aux_loss if aux_loss > 0 else threshold_loss    
+        # ret_loss = aux_loss 
         # ret_loss += entropy_loss   
         # print("***ret_loss:", ret_loss)       
         # print("***batch_stats:", batch_stats)

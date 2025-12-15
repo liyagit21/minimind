@@ -51,7 +51,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             ).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            # print("***res.aux_loss:", res.aux_loss)
+            print("***res.aux_loss:", res.aux_loss)
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
@@ -70,6 +70,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters - 1:  # 记录日志
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
+            aux_loss = res.aux_loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             # max_vio_t = np.mean(res.aggregated_stats["max_vio_tokens"])
@@ -82,7 +83,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: \
             #        max_vio:{max_vio} max_vio_t:{max_vio_t} load_imbalance:{load_imbalance}')
             
-            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, \
+            if wandb: wandb.log({"loss": current_loss, "aux_loss": aux_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, \
                                  "load_imbalance": load_imbalance, "expert_sparsity": expert_sparsity, "expert_thresholds": expert_thresholds})
             # if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, \
             #                      "max_vio": max_vio, "max_vio_t": max_vio_t, "load_imbalance": load_imbalance})
