@@ -76,11 +76,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             max_vio = np.mean(res.aggregated_stats["max_vio_selections"])
             load_imbalance = np.mean(res.aggregated_stats["load_imbalance"])
             expert_sparsity = np.mean(res.aggregated_stats["expert_sparsity"])
-            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: max_vio:{max_vio} load_imbalance:{load_imbalance} expert_sparsity:{expert_sparsity}')
+            expert_thresholds = np.mean(res.aggregated_stats["expert_thresholds"])
+            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: \
+                   max_vio:{max_vio} load_imbalance:{load_imbalance} expert_sparsity:{expert_sparsity} expert_thresholds:{expert_thresholds}')
             # Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: \
             #        max_vio:{max_vio} max_vio_t:{max_vio_t} load_imbalance:{load_imbalance}')
             
-            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, "load_imbalance": load_imbalance, "expert_sparsity": expert_sparsity})
+            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, \
+                                 "load_imbalance": load_imbalance, "expert_sparsity": expert_sparsity, "expert_thresholds": expert_thresholds})
             # if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, \
             #                      "max_vio": max_vio, "max_vio_t": max_vio_t, "load_imbalance": load_imbalance})
 
@@ -253,8 +256,8 @@ if __name__ == "__main__":
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        # model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
+        # model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
