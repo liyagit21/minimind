@@ -51,11 +51,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             ).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            print("***res.aux_loss:", res.aux_loss)
+            # print("***res.aux_loss:", res.aux_loss)
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
+            
+        # 分别计算梯度（需要retain_graph）
+        # scaler.scale(loss).backward(retain_graph=True)
+        # scaler.scale(thred_loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)  # 解除梯度缩放
@@ -209,6 +213,35 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     
+    
+    # 分离MoE参数与可训练矩阵参数
+    # 明确指定包含和排除条件
+    moe_params = []
+    thred_param = []
+    for n, p in model.named_parameters():
+      if 'expert_weights' in n:
+          thred_param.append(p)
+      else:
+          moe_params.append(p)
+          
+    # moe_params = [p for n, p in model.named_parameters() 
+    #                 if 'expert_weights' not in n ]
+    # thred_param = [p for n, p in model.named_parameters() 
+    #                 if 'expert_weights' in n ]
+    
+    # # 计算参数量（元素总数）
+    # moe_param_count = sum(p.numel() for p in moe_params)
+    # thre_param_count = sum(p.numel() for p in thre_param)
+    # total_param_count = moe_param_count + thre_param_count
+
+    # # 打印结果
+    # print("=" * 60)
+    # print(f"MOE 参数量: {moe_param_count:,}")     # 95,052,288
+    # print(f"阈值参数参数量: {thre_param_count:,}")    # 16,384
+    # print(f"总参数量: {total_param_count:,}")     # 95,068,672
+    # print(f"阈值参数占比: {thre_param_count/total_param_count*100:.2f}%")   # 0.02%
+    # print("=" * 60)
+    
     # 加载完整数据集
     full_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     
@@ -243,7 +276,16 @@ if __name__ == "__main__":
         Logger(f"Validation will use {num_val_batches} full batches (skipping incomplete last batch)")
     
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    # 这里由全部参数替换成MoE参数
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    
+    optimizer = optim.Adam([
+        {'params': moe_params, 'lr': args.learning_rate},
+        {'params': thred_param, 'lr': 1e-5}
+    ])
+    
+    # optimizer = optim.AdamW(moe_params, lr=args.learning_rate)
+    # thred_optimizer = optim.AdamW(thred_param, lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
