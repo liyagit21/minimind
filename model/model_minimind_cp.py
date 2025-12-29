@@ -303,19 +303,19 @@ class MoEGate(nn.Module):
                 minlength=self.n_routed_experts
             ).float()  # [n_routed_experts]
         self.expert_load = expert_loads
-        # total_tokens = bsz * seq_len
+        total_tokens = bsz * seq_len
         total_selections = bsz * seq_len * self.top_k
         
         # 计算两种MaxVio（根据论文理解不同）
         # 版本1：按token数计算（论文中可能更倾向这个）
         # 每个专家期望处理的token数
-        # expected_load_tokens = total_tokens / self.n_routed_experts
+        expected_load_tokens = total_tokens / self.n_routed_experts
         
         # 版本2：按选择次数计算（因为每个token选择top_k个专家）
-        expected_load_selections = total_selections / self.n_routed_experts
+        # expected_load_selections = total_selections / self.n_routed_experts
         
-        # max_vio_tokens = (expert_loads.max() - expected_load_tokens) / expected_load_tokens
-        max_vio_selections = (expert_loads.max() - expected_load_selections) / expected_load_selections
+        max_vio_tokens = (expert_loads.max() - expected_load_tokens) / expected_load_tokens
+        # max_vio_selections = (expert_loads.max() - expected_load_selections) / expected_load_selections
         
         # 计算负载不均衡度 (变异系数cv, 标准差/平均值，离散程度相对于平均值的比例，数值越小越均衡)
         load_imbalance = expert_loads.std() / expert_loads.mean()
@@ -332,7 +332,8 @@ class MoEGate(nn.Module):
         论文中的更新规则：b_i = b_i + u * sign(e_i)
         """
         if self.training and self.alpha == 0.0:
-            load_errors = self.expert_load - expected_load_selections
+            # load_errors = self.expert_load - expected_load_selections
+            load_errors = self.expert_load - expected_load_tokens
           
             # 根据论文中的更新规则更新偏置
             if self.use_additive_bias:
@@ -350,8 +351,8 @@ class MoEGate(nn.Module):
                 
         return {
             # 'expert_loads': expert_loads.detach().cpu(),
-            # 'max_vio_tokens': max_vio_tokens.item(),
-            'max_vio_selections': max_vio_selections.item(),  # 越小越好
+            'max_vio_tokens': max_vio_tokens.item(),
+            # 'max_vio_selections': max_vio_selections.item(),  # 越小越好
             'load_imbalance': load_imbalance.item(),  # 越小越好
             'expert_utilization': expert_utilization.item(),  # 越大越好
             # 'max_load': max_load.item(),
@@ -478,7 +479,7 @@ class MOEFeedForward(nn.Module):
         # topk_idx, topk_weight, aux_loss, stats = self.gate(x)
         expert_mask, routing_weights, aux_loss, stats = self.gate(x)
         if not self.adapter_thresholds:
-            flat_topk_idx = expert_mask
+            topk_idx = expert_mask
             topk_weight = routing_weights
         x = x.view(-1, x.shape[-1])   # [bsz*seq_len,hidden]
         print('***x.size:', x.size())
@@ -503,7 +504,7 @@ class MOEFeedForward(nn.Module):
                     y[expert_token_mask] += expert_output * routing_weights[expert_token_mask, expert_id].unsqueeze(-1)
             y = y.view(*orig_shape)
         else:
-            # flat_topk_idx = topk_idx.view(-1)   # size [bsz*seq_len*top_k] 拉成一维
+            flat_topk_idx = topk_idx.view(-1)   # size [bsz*seq_len*top_k] 拉成一维
             # 训练模式下，将输入分配给选定的专家，并加权求和输出
             if self.training:
                 x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)   # x shape(bsz*seq_len*num_experts_per_tok,hidden_size)
@@ -668,7 +669,8 @@ class MiniMindModel(nn.Module):
         
         # print("***aggregated_stats:", aggregated_stats)
 
-        return hidden_states, presents, aux_loss, aggregated_stats
+        return hidden_states, presents, aux_loss, aggregated_stats  
+
 
 '''
 1. 初始化模型，包括配置、模型主体和语言建模头；

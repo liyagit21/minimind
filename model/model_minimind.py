@@ -422,8 +422,8 @@ class MoEGate(nn.Module):
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         # 初始化阈值
-        # init.kaiming_uniform_(self.expert_thresholds, a=math.sqrt(5))
-        nn.init.uniform_(self.expert_weights, 0, 0.01)
+        init.kaiming_uniform_(self.expert_weights, a=math.sqrt(5))
+        # nn.init.uniform_(self.expert_weights, -0.01, 0.01)
     
         
     # def compute_max_vio(self, expert_loads: torch.Tensor, total_tokens:int) -> float:
