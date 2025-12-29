@@ -22,19 +22,10 @@ from torch.utils.data import random_split
 
 warnings.filterwarnings('ignore')
 
-
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
-    # print("***len(loader)***", len(loader))
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        # print("***step***", step)
-        # # 检查batch是否完整，不完整则跳过
-        # if X.size(0) != args.batch_size:
-        #     if step % args.log_interval == 0:  # 只在日志间隔时记录跳过信息
-        #         Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) Skip incomplete batch: {X.size(0)} samples')
-        #     continue
-            
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
@@ -51,16 +42,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             ).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            # print("***res.aux_loss:", res.aux_loss)
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
             
-        # 分别计算梯度（需要retain_graph）
-        # scaler.scale(loss).backward(retain_graph=True)
-        # scaler.scale(thred_loss).backward()
-
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)  # 解除梯度缩放
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 梯度裁剪
@@ -77,20 +63,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             aux_loss = res.aux_loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            # max_vio_t = np.mean(res.aggregated_stats["max_vio_tokens"])
             max_vio = np.mean(res.aggregated_stats["max_vio_selections"])
             load_imbalance = np.mean(res.aggregated_stats["load_imbalance"])
             expert_sparsity = np.mean(res.aggregated_stats["expert_sparsity"])
             expert_thresholds = np.mean(res.aggregated_stats["expert_thresholds"])
             Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: \
                    max_vio:{max_vio} load_imbalance:{load_imbalance} expert_sparsity:{expert_sparsity} expert_thresholds:{expert_thresholds}')
-            # Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: \
-            #        max_vio:{max_vio} max_vio_t:{max_vio_t} load_imbalance:{load_imbalance}')
             
             if wandb: wandb.log({"loss": current_loss, "aux_loss": aux_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, \
                                  "load_imbalance": load_imbalance, "expert_sparsity": expert_sparsity, "expert_thresholds": expert_thresholds})
-            # if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, \
-            #                      "max_vio": max_vio, "max_vio_t": max_vio_t, "load_imbalance": load_imbalance})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
@@ -115,7 +96,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         del X, Y, loss_mask, res, loss
 
 def evaluate_model(model, val_loader, device, autocast_ctx):
-    """评估模型并返回困惑度，跳过不完整的batch"""
+    """评估模型并返回困惑度"""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -124,10 +105,6 @@ def evaluate_model(model, val_loader, device, autocast_ctx):
     
     with torch.no_grad():
         for X, Y, loss_mask in val_loader:
-            # # 检查batch是否完整，不完整则跳过
-            # if X.size(0) != args.val_batch_size:
-            #     continue
-                
             X = X.to(device)
             Y = Y.to(device)
             loss_mask = loss_mask.to(device)
@@ -284,9 +261,6 @@ if __name__ == "__main__":
         {'params': thred_param, 'lr': 1e-5}
     ])
     
-    # optimizer = optim.AdamW(moe_params, lr=args.learning_rate)
-    # thred_optimizer = optim.AdamW(thred_param, lr=args.learning_rate)
-    
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -308,11 +282,8 @@ if __name__ == "__main__":
         if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-            # actual_batches = (len(train_ds) - (start_step + 1) * args.batch_size) // args.batch_size
-            # Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始，实际可用batch: {actual_batches}')
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
-            # train_epoch(epoch, loader, actual_batches, start_step, wandb)
         else: # 默认从头开始
             loader = DataLoader(
                 train_ds, 
@@ -323,10 +294,6 @@ if __name__ == "__main__":
                 pin_memory=True,
                 drop_last=True  
             )
-            
-            # # 计算完整的batch数量
-            # total_full_batches = len(train_ds) // args.batch_size
-            # Logger(f'Training will use {total_full_batches} full batches (skipping incomplete last batch)')
             
             # 训练前进行初始验证（只在主进程）
             # if val_loader is not None and epoch == start_epoch and start_step == 0:

@@ -235,41 +235,10 @@ class FeedForward(nn.Module):
 
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))) # 这里的*是逐元素相乘，门控机制，用于增强模型的表达能力
 
-# 计算动态阈值相关的损失
-class ThresholdRegularizationLoss(nn.Module):
-    def __init__(self, target_sparsity=0.5, diversity_weight=0.1):
-        super().__init__()
-        self.target_sparsity = target_sparsity
-        self.diversity_weight = diversity_weight
-    
-    def forward(self, expert_usage, total_tokens, expert_thresholds):
-        # 改这个添加损失，让每个专家的负载达到均衡水平
-        
-        # total_selections = total_tokens * self.top_k
-        # expected_load_selections = total_selections / self.n_routed_experts
-        # diff = expert_usage - expected_load_selections  # 那这不还是负载均衡损失吗？
-        
-        # 1. 稀疏度正则化：鼓励达到目标稀疏度
-        actual_sparsity = 1 - expert_usage.sum() / (total_tokens * len(expert_usage))
-        sparsity_loss = (actual_sparsity - self.target_sparsity) ** 2
-        
-        # 2. 阈值多样性正则化：鼓励阈值分散
-        threshold_std = torch.std(expert_thresholds)
-        diversity_loss = -threshold_std  # 最大化标准差
-        
-        # 3. 阈值平滑正则化：避免极端值
-        smooth_loss = torch.var(expert_thresholds)
-        
-        total_loss = sparsity_loss + self.diversity_weight * diversity_loss + 0.01 * smooth_loss
-
-        return total_loss
-      
 class ThresholdWeightLoss(nn.Module):
-    def __init__(self, target_sparsity=0.5, balance_weight=0.01, specialization_weight=0.1):    
+    def __init__(self, target_sparsity=0.5):    
         super().__init__()
         self.target_sparsity = target_sparsity
-        self.balance_weight = balance_weight
-        self.specialization_weight = specialization_weight
         self.n_routed_experts = 4
         self.smooth_factor = 10
         self.lambda_sparse = 1.0
@@ -277,101 +246,50 @@ class ThresholdWeightLoss(nn.Module):
     def compute_sparsity_loss(self, gate_scores, thresholds):
         """控制整体稀疏度"""
         # actual_sparsity = 1 - expert_usage.sum() / (total_tokens * len(expert_usage))
-        # sparsity_loss = F.mse_loss(actual_sparsity, 
-        #                           torch.tensor(self.target_sparsity, device=actual_sparsity.device))
         
         D = gate_scores.detach() - thresholds
         
         # 方法1：直接使用Sigmoid近似阶跃函数
         positive_activations = torch.sigmoid(self.smooth_factor * D)
         
-        # 方法2：使用带温度的Sigmoid（更稳定）
-        # temperature = 1.0
-        # positive_activations = torch.sigmoid(D / temperature)
+        expert_sparsity = positive_activations.mean(dim=0)
         
-        # 计算每个专家的期望使用频率 f_j
-        f = positive_activations.mean(dim=0)
-        # 负载均衡损失：KL散度（f与均匀分布u）
-        # u = torch.ones(self.n_routed_experts, device=D.device) / self.n_routed_experts
-        # L_balance = F.kl_div(f.log(), u, reduction='sum')  # 注意：输入需要log概率
-        
-
-        # print("***L_balance:", L_balance.item())
-        
-        # # 计算当前正激活比例（批平均）
-        # current_sparsity = torch.mean(positive_activations)
-        # token_sparse = positive_activations.mean(dim=1)
-        # # 稀疏度匹配损失
         target = torch.tensor(self.target_sparsity, device=D.device)
-        # sparse_loss = F.mse_loss(current_sparsity, target)
         
-        # # 可选：添加熵正则化以鼓励更明确的决策
+        # 添加熵正则化以鼓励更明确的决策
         entropy_loss = self._entropy_regularization(positive_activations)
         
         # 计算每个专家（列）的稀疏度
-        expert_sparsity_loss = F.mse_loss(f, target)
-        # token_sparsity_loss = F.mse_loss(token_sparse, target)
+        expert_sparsity_loss = F.mse_loss(expert_sparsity, target)
         
-        # print("***sparse_loss:", sparse_loss.item())
-        # print("***entropy_loss:", entropy_loss.item())
-        
-        # return self.lambda_sparse * (sparse_loss + 0.1 * entropy_loss) + 1e-2*L_balance
-        # return 1e-2 * L_balance
-        
-        return expert_sparsity_loss + 0.1 * entropy_loss
-      
+        # return expert_sparsity_loss + 0.1 * entropy_loss
+        return expert_sparsity_loss
       
     def _entropy_regularization(self, probs):
         """鼓励概率接近0或1（减少模糊性）"""
         entropy = -probs * torch.log(probs + 1e-10) - (1 - probs) * torch.log(1 - probs + 1e-10)
         return torch.mean(entropy)
         
-      
-    def compute_balance_loss(self, expert_usage, total_tokens, thresholds):
-        """专家负载均衡损失"""
-  
-        expert_usage_ratio = expert_usage / (total_tokens * self.n_routed_experts)
-        # print("***expert_usage",expert_usage)
-        # print("***expert_usage_ratio",expert_usage_ratio)
-        thres = thresholds.mean(0)
-        # balance_loss = -1.0 * ((expert_usage_ratio*thres).sum())
-        balance_loss = -1.0 * (expert_usage_ratio*thres).sum() / self.n_routed_experts
-        # print("***balance_loss:", balance_loss)
-        
-        # # 理想均匀分布
-        # uniform_dist = torch.ones_like(expert_usage) / len(expert_usage)
-        
-        # # KL散度衡量分布差异
-        # balance_loss = F.kl_div(
-        #     F.log_softmax(expert_usage_ratio, dim=0),
-        #     F.softmax(uniform_dist, dim=0),
-        #     reduction='batchmean'
-        # )
-        return balance_loss
-      
-    def compute_specialization_loss(self, gate_scores):
+    def compute_specialization_loss(self, thresholds):
         """专家专业性损失：鼓励专家专注于特定模式"""
-        # 计算每个专家的门控分数方差（高方差→高专业性）
-        expert_variance = gate_scores.var(dim=(0,))  # [num_experts]
-        
+        # 计算每个专家的门控分数方差（高方差→高专业性）; 阈值多样性正则化：鼓励阈值分散
+        expert_variance = thresholds.var(dim=(0,))  # [num_experts]
         # 负方差损失（鼓励高方差）
         specialization_loss = -expert_variance.mean()
         return specialization_loss
+      
+    def smooth_loss(self, thresholds):
+        # 阈值平滑正则化：避免极端值
+        smooth_loss = torch.var(thresholds)
+        return smooth_loss
         
-    def forward(self, expert_usage, total_tokens, gate_scores, thresholds):
+    def forward(self, gate_scores, thresholds):
         sparsity_loss = self.compute_sparsity_loss(gate_scores, thresholds)
-        # balance_loss = self.compute_balance_loss(expert_usage, total_tokens, thresholds)
-        # specialization_loss = self.compute_specialization_loss(gate_scores)
-        # print("***sparsity_loss:", sparsity_loss)
-        # print("***balance_loss:", balance_loss)
-        # print("***specialization_loss:", specialization_loss)
-        # total_loss = sparsity_loss + 1e-1 * balance_loss + 1e-2 * specialization_loss
-        # total_loss = 1e-5 * balance_loss + 1e-2 * sparsity_loss 
-        total_loss = 1e-1 * sparsity_loss 
-        # print("***total_loss:", total_loss)
+        # specialization_loss = self.compute_specialization_loss(thresholds)
+        # total_loss = 1e-1 * sparsity_loss + 1e-2 * specialization_loss
+        total_loss = 1e-1 * sparsity_loss
         return total_loss
 
-        
 # 用于在MoE中选择专家并计算辅助损失aux loss
 class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
@@ -392,9 +310,6 @@ class MoEGate(nn.Module):
         self.update_rate = 0.001
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))   # 门控网络的权重矩阵
         
-        
-        self.init_threshold = 0
-        
         if self.use_additive_bias:
             # 加法偏置，初始化为0
             self.register_buffer('expert_biases', torch.zeros(self.n_routed_experts))
@@ -406,26 +321,16 @@ class MoEGate(nn.Module):
         self.register_buffer('expert_loads', torch.zeros(self.n_routed_experts))
         
         # 可学习的阈值参数 - 核心创新！
-        # self.expert_thresholds = nn.Parameter(torch.full((self.n_routed_experts,), self.init_threshold))
         if self.adapter_thresholds:
-        #     self.expert_thresholds = nn.Parameter(torch.zeros(self.n_routed_experts))
-            self.expert_weights = nn.Parameter(torch.zeros(self.n_routed_experts, self.gating_dim))
+            self.expert_thresholds = nn.Parameter(torch.zeros(self.n_routed_experts, self.gating_dim))
         self.reset_parameters()
-        # # 阈值约束（确保合理性）
-        # self.threshold_clamp = (-1.0, 1.0)  # 可根据任务调整
-        # # 将损失函数作为模块属性，确保梯度链路
-        # self.threshold_loss_fn = ThresholdRegularizationLoss()
         self.threshold_loss_fn = ThresholdWeightLoss()
-        # self.adaptive_threshold_init() # 动态阈值初始化f
+        self.adaptive_threshold_init() # 动态阈值初始化f
   
             
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        # 初始化阈值
-        init.kaiming_uniform_(self.expert_weights, a=math.sqrt(5))
-        # nn.init.uniform_(self.expert_weights, -0.01, 0.01)
-    
-        
+
     # def compute_max_vio(self, expert_loads: torch.Tensor, total_tokens:int) -> float:
     #      """计算MaxVio指标 - 论文公式(4)"""
     #      expected_load = total_tokens / self.n_routed_experts
@@ -436,46 +341,39 @@ class MoEGate(nn.Module):
         """根据不同策略初始化阈值"""
         if strategy == 'uniform':
             # 均匀分布初始化
-            nn.init.uniform_(self.expert_thresholds, 0, 0.5)
+            nn.init.uniform_(self.expert_thresholds, 0, 0.01)    # 0.5 ?
         elif strategy == 'expert_capacity_based':
             # 基于期望专家容量的初始化
-            target_sparsity = 0.5  # 目标稀疏度 0.3
+            target_sparsity = 0.5  # 目标稀疏度 0.5
             init_value = norm.ppf(1 - target_sparsity)  # 逆正态累积分布
             nn.init.constant_(self.expert_thresholds, init_value)
         elif strategy == 'progressive':
             # 渐进式初始化：专家ID越大，阈值越高（鼓励早期专家更活跃）
             thresholds = torch.linspace(-0.2, 0.3, self.n_routed_experts)
             self.expert_thresholds.data = thresholds
+        elif strategy == 'kaiming':
+            init.kaiming_uniform_(self.expert_thresholds, a=math.sqrt(5))
        
        
-    def compute_statistics_update_bias(self, topk_idx: torch.Tensor, bsz: int, seq_len: int, threds) -> dict:
+    def compute_statistics(self, topk_idx: torch.Tensor, bsz: int, seq_len: int, threds) -> dict:
         """
         计算批次级别的统计信息
         返回包含MaxVio_batch和其他统计的字典
         """
 
         if self.adapter_thresholds:
-            # print("***topk_idx", topk_idx)
-            # print("***topk_idx.size", topk_idx.size())
             expert_loads = topk_idx.sum(dim=0).float()
-            # print("***adapter_threshold-expert_loads:",expert_loads)
-            # print("***expert_loads.std()", expert_loads.std())
         else:
             # 统计每个专家被选择的次数
             topk_idx_flat = topk_idx.view(-1) # [bsz * seq_len * top_k]
-            # print("***topk_idx_flat:", topk_idx_flat)
-            # 方法1：使用bincount（更高效）
             expert_loads = torch.bincount(
                 topk_idx_flat, 
                 minlength=self.n_routed_experts
             ).float()  # [n_routed_experts]
-        # print("***expert_loads:", expert_loads)    
         self.expert_loads = expert_loads
         total_tokens = bsz * seq_len
         total_selections = bsz * seq_len * self.top_k
         
-        # print("***self.expert_loads:", self.expert_loads)
-        # 计算两种MaxVio（根据论文理解不同）
         # 版本1：按token数计算（论文中可能更倾向这个）
         # 每个专家期望处理的token数
         # expected_load_tokens = total_tokens / self.n_routed_experts
@@ -496,10 +394,8 @@ class MoEGate(nn.Module):
         min_load = expert_loads[expert_loads > 0].min() if (expert_loads > 0).any() else 0
         load_ratio = max_load / min_load if min_load > 0 else float('inf')
         expert_sparsity = 1 - (expert_loads.sum().float() / (total_tokens*self.n_routed_experts))
-        # print("***expert_sparsity:", expert_sparsity)
-        # print("***self.expert_thresholds:", self.expert_thresholds.sum())
         expert_thres = threds.mean()
-        # print("***expert_thres", expert_thres)
+        
         return {
             # 'expert_loads': expert_loads.detach().cpu(),
             # 'max_vio_tokens': max_vio_tokens.item(),  # 越小越好
@@ -511,11 +407,7 @@ class MoEGate(nn.Module):
             'load_ratio': load_ratio if not torch.is_tensor(load_ratio) else load_ratio.item(),   # 越小越好
             'expert_sparsity': expert_sparsity.item(),
             'expert_thresholds':expert_thres.item(),
-            # 'expert_thresholds':self.expert_thresholds.sum().item()
-            # 'total_tokens': total_tokens,
-            # 'total_selections': total_selections,
         }
-        
         
     def update_expert_biases(self, total_tokens):
         expected_load_selections = total_tokens * self.top_k / self.n_routed_experts
@@ -562,10 +454,10 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
-        threds = F.linear(hidden_states, self.expert_weights, None)
+        threds = F.linear(hidden_states, self.expert_thresholds, None)
         
         if self.scoring_func == 'softmax':
-            # scores = torch.softmax(logits / 0.9, dim=-1)
+            # scores = torch.softmax(logits / 0.9, dim=-1)  # 当使用expert_biases来解决负载均衡问题时，带有温度缩放的softmax可以使路由的决策占比加大，以减少引入bias导致的性能降低
             scores = torch.softmax(logits, dim=-1)
             threds = torch.softmax(threds, dim=-1)
         elif self.scoring_func == 'sigmoid':
@@ -577,74 +469,60 @@ class MoEGate(nn.Module):
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
         
-        # print("***scores:", scores)
         # entropy_regularization = True
         # if entropy_regularization:
         #     entropy = -torch.sum(scores * torch.log(scores + 1e-10), dim=-1)
         #     # 熵正则化损失
         #     entropy_loss = 0.01 * entropy.mean()
         
-        total_tokens = bsz*seq_len
+        # total_tokens = bsz*seq_len
         # 应用loss-free的偏置
         # if self.alpha == 0.0:
         #     scores = self.apply_loss_free_balancing(scores)
-        # print("***scores:", scores.size())
         
         ret_idx, ret_weight = [], []
         # 动态专家选择：使用可学习阈值！
         if self.adapter_thresholds:
-            # expert_mask = scores > self.expert_thresholds.clamp(*self.threshold_clamp)
             expert_mask = (scores > threds)
             # expert_mask = scores > 0
-            # print("***expert_mask.size:", expert_mask.size())
-            # print("***expert_mask:", expert_mask)
             ret_idx = expert_mask
             ret_weight = scores
         else:
             # scores:[bsz*seq_len,n], topk_weight:[bsz*seq_len,top_k], topk_idx:[bsz*seq_len,top_k]
             topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)  # 选择前 k 个最重要的专家及其权重
-            # print("***topk_weight:", topk_weight.size())
-            # print("***topk_idx:", topk_idx.size())
-    
+
             if self.top_k > 1 and self.norm_topk_prob:    # 对top_k 的权重进行归一化
                 denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
                 topk_weight = topk_weight / denominator
             ret_idx = topk_idx
             ret_weight = topk_weight   
             
+        batch_stats = self.compute_statistics(ret_idx, bsz, seq_len, threds)
         
-        batch_stats = self.compute_statistics_update_bias(ret_idx, bsz, seq_len, threds)
-        
-        self.update_expert_biases(total_tokens)
+        # # loss-free策略
+        # self.update_expert_biases(total_tokens)
         
         aux_loss = 0
         threshold_loss = 0
-        aux_and_adapter_thre = 0
+        aux_and_adapter_thre = 0  # 动态阈值下是否计算aux_loss
         
         if self.training:    # 仅在训练时计算辅助损失
             if self.alpha > 0.0:
-                scores_for_aux = scores
-                if self.seq_aux:
-                    if aux_and_adapter_thre:    # 计算序列级别的辅助损失
-                        scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                if self.seq_aux: # 计算序列级别的辅助损失
+                    scores_for_aux = scores.view(bsz, seq_len, -1)
+                    if aux_and_adapter_thre:    
                         ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                         # 使用masked scatter计算激活次数
                         activated_counts = expert_mask.view(bsz, seq_len, -1).sum(dim=1)  # 每个专家在每个批次中的激活次数
                         ce = activated_counts.float()
-                        print("***ce", ce)
-                        print("***ce.size", ce.size())
                         # 归一化负载分布
                         total_activations = expert_mask.view(bsz, seq_len, -1).sum(dim=(1, 2)).float()  # 每个批次的总激活次数
-                        print("***total_activations", total_activations)
-                        print("***total_activations.size", total_activations.size())
                         ce.div_(total_activations.view(-1, 1) / self.n_routed_experts)
                         # 计算序列级别的辅助损失
-                        aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
-                        # print("***here aux_loss:", aux_loss)
+                        aux_loss = (ce * scores_for_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
                     else:
                         aux_topk = self.top_k
                         topk_idx_for_aux_loss = topk_idx.view(bsz, -1)  # shape:[bsz*seq_len,top_k] -> [bsz,seq_len*top_k]
-                        scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
                         ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                         # 将torch.ones的值累加到ce中，索引由topk_idx_for_aux_loss指定
                         # 将结果除以 (seq_len * aux_topk / self.n_routed_experts)，归一化负载分布
@@ -652,24 +530,18 @@ class MoEGate(nn.Module):
                                         torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                             seq_len * aux_topk / self.n_routed_experts)       # ce计算每个专家在每个批次中的负载分布
                 
-                        aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha   # 根据负载分布和分数分布计算序列级别的辅助损失
+                        aux_loss = (ce * scores_for_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha   # 根据负载分布和分数分布计算序列级别的辅助损失
                 else:
                     mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)  # 将生成的专家索引转成one-hot编码，shape(bsz*seq_len*top_k, n_routed_experts)
                     ce = mask_ce.float().mean(0)   # 计算每个专家的负载分布，shape为(n_routed_experts,)
-                    Pi = scores_for_aux.mean(0)   # 门控网络的输出
+                    Pi = scores.mean(0)   # 门控网络的输出
                     fi = ce * self.n_routed_experts
                     aux_loss = (Pi * fi).sum() * self.alpha
             elif self.adapter_thresholds:
-                # threshold_loss = self.threshold_loss_fn(self.expert_loads, total_tokens, self.expert_thresholds)
-                threshold_loss = self.threshold_loss_fn(self.expert_loads, total_tokens, scores*expert_mask.float(), threds)
-                # print('***threshold_loss:', threshold_loss)
-        # print("***threshold_loss:", threshold_loss)
+                threshold_loss = self.threshold_loss_fn(scores*expert_mask.float(), threds)
+
         ret_loss = aux_loss if aux_loss > 0 else threshold_loss    
-        # ret_loss = aux_loss 
-        # ret_loss += entropy_loss   
-        # print("***ret_loss:", ret_loss)       
-        # print("***batch_stats:", batch_stats)
-        # return topk_idx, topk_weight, aux_loss, batch_stats
+    
         return ret_idx, ret_weight, ret_loss, batch_stats
 
 
@@ -702,13 +574,11 @@ class MOEFeedForward(nn.Module):
         # print("***x.size:", x.size())   # torch.Size([32, 511, 512])
         identity = x
         orig_shape = x.shape
-        bsz, seq_len, _ = x.shape
         # 使用门控机制选择专家
         # topk_idx, topk_weight, aux_loss, stats = self.gate(x)
         expert_mask, routing_weights, aux_loss, stats = self.gate(x)
         
         # 调试梯度流
-        # 在训练循环中添加
         # if hasattr(self.gate, 'expert_thresholds') and self.gate.expert_thresholds.grad is not None:
         #     print("Threshold gradients:", self.gate.expert_thresholds.grad)
         
@@ -716,25 +586,16 @@ class MOEFeedForward(nn.Module):
             topk_idx = expert_mask
             topk_weight = routing_weights
         x = x.view(-1, x.shape[-1])   # [bsz*seq_len,hidden]
-        # print('***x.size:', x.size())
+        
         if self.adapter_thresholds:
             # MoE计算
             y = torch.zeros_like(x)
-            # expert_usage = torch.zeros(self.n_routed_experts, device=x.device)
             for expert_id in range(len(self.experts)):
                 # 获取该专家需要处理的token
                 expert_token_mask = expert_mask[:, expert_id] 
-                # print("***x", x)
-                # print("***x.size", x.size())
-                # print("***expert_token_mask", expert_token_mask)
-                # print("***expert_token_mask.size:", expert_token_mask.size())
                 if expert_token_mask.any():
                     expert_input = x[expert_token_mask]   # 实际选择这个专家的token数
-                    # print("***expert_input", expert_input)
-                    # print("***expert_input.size:", expert_input.size())
                     expert_output = self.experts[expert_id](expert_input)
-                    # print("***expert_output", expert_output)
-                    # print("***expert_output.size:", expert_output.size())
                     y[expert_token_mask] += expert_output * routing_weights[expert_token_mask, expert_id].unsqueeze(-1)
             y = y.view(*orig_shape)
         else:
@@ -747,8 +608,6 @@ class MOEFeedForward(nn.Module):
                     # x[flat_topk_idx == i]根据布尔索引选择出指定位置的输入，
                     # 比如x=[[1, 2],[3, 4],[5, 6]], flat_topk_idx == i = [True,False,True]
                     # x[flat_topk_idx == i] = [[1, 2],[5, 6]]
-                    # print('----x.size', x.size())
-                    # print('----flat_topk_idx.size', flat_topk_idx.size())
                     y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 将选定专家的输出存储到y中，并确保类型一致
                 # print("***topk_weight.size:", topk_weight.size())   # torch.Size([16352, 2])
                 y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)   # 将专家输出与权重求和
@@ -941,10 +800,8 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):  # PreTrainedModel�
             use_cache=use_cache,
             **args
         )
-        # print("***aux_loss:", aux_loss)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        # output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output = MiniMindCausalLMOutputWithPast(
             logits=logits, 
             past_key_values=past_key_values, 
@@ -952,7 +809,4 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):  # PreTrainedModel�
             aux_loss=aux_loss, 
             aggregated_stats=aggregated_stats)
         
-        # output.aux_loss = aux_loss
-        # print("***output.aux_loss:", output.aux_loss)
-        # output.aggregated_stats = aggregated_stats
         return output
