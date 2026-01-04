@@ -256,14 +256,13 @@ class ThresholdWeightLoss(nn.Module):
         
         target = torch.tensor(self.target_sparsity, device=D.device)
         
-        # 添加熵正则化以鼓励更明确的决策
+        # 添加熵正则化以鼓励更明确的决策，不加这个性能会将(10.24->10.33)
         entropy_loss = self._entropy_regularization(positive_activations)
         
         # 计算每个专家（列）的稀疏度
         expert_sparsity_loss = F.mse_loss(expert_sparsity, target)
         
-        # return expert_sparsity_loss + 0.1 * entropy_loss
-        return expert_sparsity_loss
+        return expert_sparsity_loss + 0.1 * entropy_loss
       
     def _entropy_regularization(self, probs):
         """鼓励概率接近0或1（减少模糊性）"""
