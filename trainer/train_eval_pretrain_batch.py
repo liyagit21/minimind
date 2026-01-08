@@ -60,18 +60,18 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters - 1:  # 记录日志
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
-            aux_loss = res.aux_loss.item() * args.accumulation_steps
+            # aux_loss = res.aux_loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             max_vio = np.mean(res.aggregated_stats["max_vio_selections"])
             load_imbalance = np.mean(res.aggregated_stats["load_imbalance"])
             expert_sparsity = np.mean(res.aggregated_stats["expert_sparsity"])
-            expert_thresholds = np.mean(res.aggregated_stats["expert_thresholds"])
+            # expert_thresholds = np.mean(res.aggregated_stats["expert_thresholds"])
             Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min: \
-                   max_vio:{max_vio} load_imbalance:{load_imbalance} expert_sparsity:{expert_sparsity} expert_thresholds:{expert_thresholds}')
+                   max_vio:{max_vio} load_imbalance:{load_imbalance} expert_sparsity:{expert_sparsity}')
             
-            if wandb: wandb.log({"loss": current_loss, "aux_loss": aux_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, \
-                                 "load_imbalance": load_imbalance, "expert_sparsity": expert_sparsity, "expert_thresholds": expert_thresholds})
+            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min, "max_vio": max_vio, \
+                                 "load_imbalance": load_imbalance, "expert_sparsity": expert_sparsity})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()

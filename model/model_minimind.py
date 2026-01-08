@@ -319,12 +319,12 @@ class MoEGate(nn.Module):
         # 用于监控专家负载的历史记录
         self.register_buffer('expert_loads', torch.zeros(self.n_routed_experts))
         
-        # 可学习的阈值参数 - 核心创新！
-        if self.adapter_thresholds:
-            self.expert_thresholds = nn.Parameter(torch.zeros(self.n_routed_experts, self.gating_dim))
+        # # 可学习的阈值参数 - 核心创新！
+        # if self.adapter_thresholds:
+        #     self.expert_thresholds = nn.Parameter(torch.zeros(self.n_routed_experts, self.gating_dim))
         self.reset_parameters()
-        self.threshold_loss_fn = ThresholdWeightLoss()
-        self.adaptive_threshold_init() # 动态阈值初始化f
+        # self.threshold_loss_fn = ThresholdWeightLoss()
+        # self.adaptive_threshold_init() # 动态阈值初始化f
   
             
     def reset_parameters(self) -> None:
@@ -354,7 +354,7 @@ class MoEGate(nn.Module):
             init.kaiming_uniform_(self.expert_thresholds, a=math.sqrt(5))
        
        
-    def compute_statistics(self, topk_idx: torch.Tensor, bsz: int, seq_len: int, threds) -> dict:
+    def compute_statistics(self, topk_idx: torch.Tensor, bsz: int, seq_len: int) -> dict:
         """
         计算批次级别的统计信息
         返回包含MaxVio_batch和其他统计的字典
@@ -393,7 +393,7 @@ class MoEGate(nn.Module):
         min_load = expert_loads[expert_loads > 0].min() if (expert_loads > 0).any() else 0
         load_ratio = max_load / min_load if min_load > 0 else float('inf')
         expert_sparsity = 1 - (expert_loads.sum().float() / (total_tokens*self.n_routed_experts))
-        expert_thres = threds.mean()
+        # expert_thres = threds.mean()
         
         return {
             # 'expert_loads': expert_loads.detach().cpu(),
@@ -405,7 +405,7 @@ class MoEGate(nn.Module):
             # 'min_load': min_load.item() if torch.is_tensor(min_load) else min_load,
             'load_ratio': load_ratio if not torch.is_tensor(load_ratio) else load_ratio.item(),   # 越小越好
             'expert_sparsity': expert_sparsity.item(),
-            'expert_thresholds':expert_thres.item(),
+            # 'expert_thresholds':expert_thres.item(),
         }
         
     def update_expert_biases(self, total_tokens):
@@ -453,18 +453,22 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
-        threds = F.linear(hidden_states, self.expert_thresholds, None)
+        # threds = F.linear(hidden_states, self.expert_thresholds, None)
+        
+        # 应用loss-free的偏置
+        if self.alpha == 0.0:
+            logits = self.apply_loss_free_balancing(logits)
         
         if self.scoring_func == 'softmax':
             # scores = torch.softmax(logits / 0.9, dim=-1)  # 当使用expert_biases来解决负载均衡问题时，带有温度缩放的softmax可以使路由的决策占比加大，以减少引入bias导致的性能降低
             scores = torch.softmax(logits, dim=-1)
-            threds = torch.softmax(threds, dim=-1)
+            # threds = torch.softmax(threds, dim=-1)
         elif self.scoring_func == 'sigmoid':
             scores = torch.sigmoid(logits)
-            threds = torch.sigmoid(threds)
+            # threds = torch.sigmoid(threds)
         elif self.scoring_func == 'tanh':
             scores = torch.tanh(logits)
-            threds = torch.tanh(threds)
+            # threds = torch.tanh(threds)
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
         
@@ -474,16 +478,14 @@ class MoEGate(nn.Module):
         #     # 熵正则化损失
         #     entropy_loss = 0.01 * entropy.mean()
         
-        # total_tokens = bsz*seq_len
-        # 应用loss-free的偏置
-        # if self.alpha == 0.0:
-        #     scores = self.apply_loss_free_balancing(scores)
+        total_tokens = bsz*seq_len
+
         
         ret_idx, ret_weight = [], []
         # 动态专家选择：使用可学习阈值！
         if self.adapter_thresholds:
-            expert_mask = (scores > threds)
-            # expert_mask = scores > 0
+            # expert_mask = (scores > threds)
+            expert_mask = scores > 0
             ret_idx = expert_mask
             ret_weight = scores
         else:
@@ -496,10 +498,10 @@ class MoEGate(nn.Module):
             ret_idx = topk_idx
             ret_weight = topk_weight   
             
-        batch_stats = self.compute_statistics(ret_idx, bsz, seq_len, threds)
+        batch_stats = self.compute_statistics(ret_idx, bsz, seq_len)
         
         # # loss-free策略
-        # self.update_expert_biases(total_tokens)
+        self.update_expert_biases(total_tokens)
         
         aux_loss = 0
         threshold_loss = 0
@@ -536,8 +538,7 @@ class MoEGate(nn.Module):
                     Pi = scores.mean(0)   # 门控网络的输出
                     fi = ce * self.n_routed_experts
                     aux_loss = (Pi * fi).sum() * self.alpha
-            elif self.adapter_thresholds:
-                threshold_loss = self.threshold_loss_fn(scores*expert_mask.float(), threds)
+
 
         ret_loss = aux_loss if aux_loss > 0 else threshold_loss    
     
